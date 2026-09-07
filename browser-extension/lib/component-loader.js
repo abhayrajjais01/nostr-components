@@ -2,8 +2,44 @@
 
 (function () {
   const extension = globalThis.NostrLikeExtension = globalThis.NostrLikeExtension || {};
+  const HYDRATION_EVENT_PREFIX = 'nostr-components-hydrate:';
+  const RELAY_BOOTSTRAP_EVENT = 'nostr-components-relay-bootstrap:v2';
+  const CHANNEL_PATTERN = /^[0-9a-f]{64}$/;
+  const actionContexts = new WeakMap();
+  let hydrationEventName = null;
+  let revocationEventName = null;
+  let resolveReady;
+  let rejectReady;
+  const ready = new Promise(function (resolve, reject) {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
 
-  function createChannel() {
+  function receiveBootstrap(event) {
+    const relayChannel = String(event.detail?.relayChannel || '');
+    const hydrationChannel = String(event.detail?.hydrationChannel || '');
+    if (
+      event.target !== document ||
+      !CHANNEL_PATTERN.test(relayChannel) ||
+      !CHANNEL_PATTERN.test(hydrationChannel)
+    ) {
+      return;
+    }
+
+    document.removeEventListener(RELAY_BOOTSTRAP_EVENT, receiveBootstrap, true);
+    try {
+      extension.relayClient.configure(relayChannel);
+      hydrationEventName = HYDRATION_EVENT_PREFIX + hydrationChannel;
+      revocationEventName = 'nostr-components-revoke:' + hydrationChannel;
+      resolveReady(true);
+    } catch (error) {
+      rejectReady(error);
+    }
+  }
+
+  document.addEventListener(RELAY_BOOTSTRAP_EVENT, receiveBootstrap, true);
+
+  function createActionId() {
     const bytes = new Uint8Array(32);
     crypto.getRandomValues(bytes);
     return Array.from(bytes, function (value) {
@@ -11,39 +47,77 @@
     }).join('');
   }
 
-  async function sendInjectionRequest(channel) {
-    const message = {
-      type: 'INJECT_NOSTR_LIKE_COMPONENT',
-      channel: channel
+  function registerAction(slot, context) {
+    if (
+      !slot ||
+      !context ||
+      (context.kind !== 'x' && context.kind !== 'youtube') ||
+      !extension.relayClient.isAllowedContentUrl(context.url)
+    ) {
+      throw new Error('Invalid isolated action context');
+    }
+    const previous = actionContexts.get(slot);
+    const next = {
+      actionId: previous?.actionId || createActionId(),
+      kind: context.kind,
+      url: context.url,
+      theme: context.theme === 'dark' ? 'dark' : 'light',
+      recipientNpub: extension.url.isValidNpub(context.recipientNpub)
+        ? context.recipientNpub
+        : null
     };
-
-    let response;
-    if (typeof browser !== 'undefined' && browser.runtime) {
-      response = await browser.runtime.sendMessage(message);
-    } else if (typeof chrome !== 'undefined' && chrome.runtime) {
-      response = await new Promise(function (resolve, reject) {
-        chrome.runtime.sendMessage(message, function (value) {
-          const error = chrome.runtime && chrome.runtime.lastError;
-          if (error) {
-            reject(new Error(error.message));
-            return;
-          }
-          resolve(value);
-        });
-      });
-    } else {
-      throw new Error('Browser runtime API is not available');
-    }
-
-    if (!response || response.ok !== true) {
-      throw new Error((response && response.error) || 'Like component injection failed');
-    }
+    extension.relayClient.registerActionContext(next.actionId, {
+      kind: next.kind,
+      url: next.url,
+      recipientNpub: next.recipientNpub
+    });
+    actionContexts.set(slot, next);
   }
 
-  const channel = createChannel();
-  extension.relayClient.configure(channel);
+  function updateAction(slot, patch) {
+    const current = actionContexts.get(slot);
+    if (!current) return false;
+    registerAction(slot, {
+      ...current,
+      ...patch
+    });
+    return true;
+  }
+
+  function revokeAction(slot) {
+    const context = actionContexts.get(slot);
+    if (!context) return false;
+    actionContexts.delete(slot);
+    extension.relayClient.revokeActionContext(context.actionId);
+    if (revocationEventName) {
+      slot.dispatchEvent(new Event(revocationEventName));
+    }
+    return true;
+  }
+
+  function hydrate(slot) {
+    if (!hydrationEventName) {
+      throw new Error('MAIN-world component bridge is not ready');
+    }
+    const context = actionContexts.get(slot);
+    if (!context) {
+      throw new Error('Unknown isolated action slot');
+    }
+    slot.dispatchEvent(new CustomEvent(hydrationEventName, {
+      bubbles: true,
+      detail: Object.freeze({ ...context })
+    }));
+    if (!slot.querySelector('nostr-like-button')) {
+      throw new Error('MAIN-world component hydrator did not create Nostr Like');
+    }
+    return true;
+  }
+
   extension.componentLoader = {
-    channel: channel,
-    ready: sendInjectionRequest(channel)
+    ready: ready,
+    registerAction: registerAction,
+    updateAction: updateAction,
+    revokeAction: revokeAction,
+    hydrate: hydrate
   };
 })();

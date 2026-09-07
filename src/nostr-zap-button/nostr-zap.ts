@@ -11,6 +11,13 @@ import { fetchTotalZapAmount, ZapDetails } from './zap-utils';
 import { isValidUrl } from '../common/utils';
 import type { DialogComponent } from '../base/dialog-component/dialog-component';
 import { ensureSignerForAction } from '../common/auth-onboarding';
+import {
+  getRelayTransport,
+  hasInstalledRelayTransport,
+} from '../common/relay-transport';
+import { setTrustedInnerHTML } from '../common/trusted-html';
+import { getTrustedActionContext } from '../common/trusted-action-context';
+import { isTrustedUserEvent } from '../common/trusted-user-activation';
 
 /**
  * <nostr-zap-button>
@@ -22,6 +29,7 @@ import { ensureSignerForAction } from '../common/auth-onboarding';
  *   - amount          (optional) : pre-defined zap amount in sats
  *   - default-amount  (optional) : default zap amount in sats (default 21)
  *   - url             (optional) : URL to send zap to (enables URL-based zaps)
+ *   - compact         (optional) : icon-only action for host action bars
  * 
  *  TODO: Doesn't yet support dynamic updates of attributes.
  */
@@ -29,10 +37,10 @@ export default class NostrZap extends NostrUserComponent {
   protected zapActionStatus=   this.channel('zapAction');
   protected zapListStatus  =   this.channel('zapList');
   
-  private totalZapAmount: number | null = null;
-  private cachedZapDetails: ZapDetails[] = [];
-  private cachedAmountDialog: DialogComponent | null = null;
-  private zapCountLoadSeq = 0;
+  #totalZapAmount: number | null = null;
+  #cachedZapDetails: ZapDetails[] = [];
+  #cachedAmountDialog: DialogComponent | null = null;
+  #zapCountLoadSeq = 0;
 
   constructor() {
     super();
@@ -53,24 +61,34 @@ export default class NostrZap extends NostrUserComponent {
       'text',
       'amount',
       'default-amount',
-      'url'
+      'url',
+      'compact'
     ];
   }
 
   attributeChangedCallback(name: string, oldValue: string | null, newValue: string | null) {
     if (oldValue === newValue) return;
     super.attributeChangedCallback(name, oldValue, newValue);
-    // TODO: To handle text, amount, and default-amount changes?
+    if (
+      name === 'npub' ||
+      name === 'url' ||
+      name === 'relays' ||
+      name === 'amount' ||
+      name === 'default-amount'
+    ) {
+      this.#closeCachedAmountDialog();
+    }
     this.render();
   }
 
   disconnectedCallback() {
-    if (
-      this.cachedAmountDialog &&
-      typeof this.cachedAmountDialog.close === "function"
-    ) {
-      this.cachedAmountDialog.close();
-    }
+    super.disconnectedCallback?.();
+    this.#closeCachedAmountDialog();
+  }
+
+  #closeCachedAmountDialog() {
+    this.#cachedAmountDialog?.close();
+    this.#cachedAmountDialog = null;
   }
 
   /** Base class functions */
@@ -83,8 +101,40 @@ export default class NostrZap extends NostrUserComponent {
     this.updateZapCount();
   }
 
+  /** A host relay transport replaces only networking, not the component UI/signer. */
+  protected async connectToNostr() {
+    if (
+      hasInstalledRelayTransport() &&
+      !getTrustedActionContext(this)
+    ) {
+      throw new Error('Untrusted extension action');
+    }
+    if (!getRelayTransport()) {
+      await super.connectToNostr();
+      return;
+    }
+
+    this.conn.set(NCStatus.Ready);
+    this.nostrReadyResolve?.();
+    try {
+      this.onNostrRelaysConnected();
+    } catch (hookError) {
+      console.error('Error in onNostrRelaysConnected hook:', hookError);
+    }
+  }
+
   /** Protected methods */
   protected validateInputs(): boolean {
+    if (
+      hasInstalledRelayTransport() &&
+      !getTrustedActionContext(this)
+    ) {
+      this.zapActionStatus.set(NCStatus.Error, 'Untrusted extension action');
+      this.zapListStatus.set(NCStatus.Error, 'Untrusted extension action');
+      this.userStatus.set(NCStatus.Idle);
+      return false;
+    }
+
     if (!super.validateInputs()) {
       this.zapActionStatus.set(NCStatus.Idle);
       this.zapListStatus.set(NCStatus.Idle);
@@ -94,7 +144,8 @@ export default class NostrZap extends NostrUserComponent {
     const textAttr      = this.getAttribute("text");
     const amtAttr       = this.getAttribute("amount");
     const defaultAmtAttr= this.getAttribute("default-amount");
-    const urlAttr       = this.getAttribute("url");
+    const urlAttr       =
+      getTrustedActionContext(this)?.url || this.getAttribute("url");
     const tagName       = this.tagName.toLowerCase();
 
     let errorMessage: string | null = null;
@@ -133,7 +184,7 @@ export default class NostrZap extends NostrUserComponent {
   }
 
   /** Private functions */
-  private async handleZapClick() {
+  async #handleZapClick() {
     if (this.userStatus.get() !== NCStatus.Ready) return;
     if (this.zapActionStatus.get() === NCStatus.Loading) return;
 
@@ -161,19 +212,27 @@ export default class NostrZap extends NostrUserComponent {
         return;
       }
 
-      if (!this.user) {
+      const trustedContext = getTrustedActionContext(this);
+      if (hasInstalledRelayTransport() && !trustedContext) {
+        throw new Error('Untrusted extension action');
+      }
+      const npub =
+        trustedContext?.recipientNpub ||
+        this.user?.npub ||
+        this.getAttribute('npub');
+      if (!npub) {
         this.zapActionStatus.set(NCStatus.Error, "Could not resolve user to zap.");
         this.render();
         return;
       }
 
       const relays = this.getRelays().join(",");
-      const npub = this.user.npub;
 
-      this.cachedAmountDialog = await openZapModal({
+      this.#cachedAmountDialog = await openZapModal({
+        actionId: trustedContext?.actionId,
         npub,
         relays,
-        cachedDialogComponent: this.cachedAmountDialog,
+        cachedDialogComponent: this.#cachedAmountDialog,
         theme: this.theme === 'dark' ? 'dark' : 'light',
         fixedAmount: (() => {
           const amtAttr = this.getAttribute("amount");
@@ -195,7 +254,7 @@ export default class NostrZap extends NostrUserComponent {
           }
           return num;
         })(),
-        url: this.getAttribute("url") || undefined,
+        url: trustedContext?.url || this.getAttribute("url") || undefined,
         anon: false,
       });
       this.zapActionStatus.set(NCStatus.Ready);
@@ -206,7 +265,7 @@ export default class NostrZap extends NostrUserComponent {
     }
   }
 
-  private async handleHelpClick() {
+  async #handleHelpClick() {
     try {
       await showHelpDialog(this.theme === 'dark' ? 'dark' : 'light');
     } catch (error) {
@@ -214,16 +273,17 @@ export default class NostrZap extends NostrUserComponent {
     }
   }
 
-  private async handleZappersClick() {
-    if (this.cachedZapDetails.length === 0) {
+  async #handleZappersClick() {
+    if (this.#cachedZapDetails.length === 0) {
       return; // No zaps to show
     }
 
     try {
       await openZappersDialog({
-        zapDetails: this.cachedZapDetails,
+        zapDetails: this.#cachedZapDetails,
         theme: this.theme === 'dark' ? 'dark' : 'light',
         relays: this.getRelays(),
+        actionId: getTrustedActionContext(this)?.actionId,
       });
     } catch (error) {
       console.error("Nostr-Components: Zap button: Error opening zappers dialog", error);
@@ -232,59 +292,65 @@ export default class NostrZap extends NostrUserComponent {
 
   private attachDelegatedListeners() {
     this.delegateEvent('click', '.nostr-zap-button', (e) => {
+      if (!isTrustedUserEvent(e)) return;
       e.preventDefault?.();
       e.stopPropagation?.();
-      void this.handleZapClick();
+      void this.#handleZapClick();
     });
 
     this.delegateEvent('click', '.help-icon', (e) => {
+      if (!isTrustedUserEvent(e)) return;
       e.preventDefault?.();
       e.stopPropagation?.();
-      this.handleHelpClick();
+      void this.#handleHelpClick();
     });
 
     this.delegateEvent('click', '.total-zap-amount', (e) => {
+      if (!isTrustedUserEvent(e)) return;
       e.preventDefault?.();
       e.stopPropagation?.();
-      void this.handleZappersClick();
+      void this.#handleZappersClick();
     });
 
     this.delegateEvent('keydown', '.total-zap-amount.clickable', (e: KeyboardEvent) => {
+      if (!isTrustedUserEvent(e)) return;
       if (e.key !== 'Enter' && e.key !== ' ') return;
       e.preventDefault();
       e.stopPropagation();
-      void this.handleZappersClick();
+      void this.#handleZappersClick();
     });
   }
 
   private async updateZapCount() {
     if (!this.user) return;
-    const seq = ++this.zapCountLoadSeq;
+    const seq = ++this.#zapCountLoadSeq;
+    const trustedContext = getTrustedActionContext(this);
 
     try {
       this.zapListStatus.set(NCStatus.Loading);
       this.render();
       
       await this.ensureNostrConnected();
-      if (seq !== this.zapCountLoadSeq) return;
+      if (seq !== this.#zapCountLoadSeq) return;
 
       const result = await fetchTotalZapAmount({ 
         pubkey: this.user.pubkey, 
         relays: this.getRelays(),
-        url: this.getAttribute("url") || undefined
+        url: trustedContext?.url || this.getAttribute("url") || undefined,
+        actionId: trustedContext?.actionId,
       });
-      if (seq !== this.zapCountLoadSeq) return;
+      if (seq !== this.#zapCountLoadSeq) return;
 
-      this.totalZapAmount = result.totalAmount;
-      this.cachedZapDetails = result.zapDetails;
+      this.#totalZapAmount = result.totalAmount;
+      this.#cachedZapDetails = result.zapDetails;
       this.zapListStatus.set(NCStatus.Ready);
     } catch (e) {
-      if (seq !== this.zapCountLoadSeq) return;
+      if (seq !== this.#zapCountLoadSeq) return;
       console.error("Nostr-Components: Zap button: Failed to fetch zap count", e);
-      this.totalZapAmount = null;
+      this.#totalZapAmount = null;
       this.zapListStatus.set(NCStatus.Error);
     } finally {
-      if (seq === this.zapCountLoadSeq) {
+      if (seq === this.#zapCountLoadSeq) {
         this.render();
       }
     }
@@ -305,14 +371,15 @@ export default class NostrZap extends NostrUserComponent {
       isSuccess: false, // TODO: Add success state handling
       errorMessage: errorMessage,
       buttonText: buttonText,
-      totalZapAmount: this.totalZapAmount,
-      hasZaps: this.cachedZapDetails.length > 0,
+      totalZapAmount: this.#totalZapAmount,
+      hasZaps: this.#cachedZapDetails.length > 0,
+      compact: this.hasAttribute('compact'),
     };
 
-    this.shadowRoot!.innerHTML = `
+    setTrustedInnerHTML(this.shadowRoot!, `
       ${getZapButtonStyles()}
       ${renderZapButton(renderOptions)}
-    `;
+    `);
   }
 }
 

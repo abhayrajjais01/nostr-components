@@ -54,7 +54,24 @@ describe('renderLikeButton', () => {
     expect(html).not.toContain('12 likes');
     expect(html).not.toContain('>Like</span>');
     expect(html).not.toContain('help-icon');
+    expect(html).not.toContain('like-count clickable');
     expect(html.indexOf('>12</span>')).toBeLessThan(html.indexOf('</button>'));
+  });
+
+  it('marks only the standalone count as a likers-dialog target', () => {
+    const html = renderLikeButton({
+      isLoading: false,
+      isError: false,
+      errorMessage: '',
+      buttonText: 'Like',
+      isLiked: false,
+      likeCount: 12,
+      hasLikes: true,
+      compact: false,
+    });
+
+    expect(html).toContain('class="like-count clickable"');
+    expect(html).toContain('aria-label="View likers"');
   });
 
   it('keeps compact actions enabled while only relay startup is pending', () => {
@@ -99,5 +116,16 @@ describe('renderLikeButton', () => {
       /:host\(\[compact\]\) \.nostr-like-button svg path \{[^}]*stroke-width: 7/s,
     );
     expect(styles).not.toContain('pointer-events: none');
+  });
+
+  it('overrides X compact geometry with a native-sized YouTube pill', () => {
+    const styles = getLikeButtonStyles();
+
+    expect(styles).toMatch(
+      /:host\(\[compact\]\[data-surface="youtube"\]\)\s*\{[^}]*height: 40px/s,
+    );
+    expect(styles).toMatch(
+      /:host\(\[compact\]\[data-surface="youtube"\]\) \.nostr-like-button\s*\{[^}]*min-width: 40px/s,
+    );
   });
 });

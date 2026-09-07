@@ -8,6 +8,7 @@ import { getLikeButtonStyles } from './style';
 import { showHelpDialog } from './dialog-help';
 import { isValidUrl } from '../common/utils';
 import { 
+  fetchCachedLikeStateForUrl,
   fetchLikesForUrl, 
   createLikeEvent,
   createUnlikeEvent,
@@ -17,8 +18,14 @@ import {
   LikeCountResult 
 } from './like-utils';
 import { ensureSignerForAction } from '../common/auth-onboarding';
-import { getRelayTransport } from '../common/relay-transport';
+import {
+  getRelayTransport,
+  hasInstalledRelayTransport,
+} from '../common/relay-transport';
 import { normalizeURL } from 'nostr-tools/utils';
+import { setTrustedInnerHTML } from '../common/trusted-html';
+import { getTrustedActionContext } from '../common/trusted-action-context';
+import { isTrustedUserEvent } from '../common/trusted-user-activation';
 import {
   applyOptimisticLike,
   applyOptimisticUnlike,
@@ -110,7 +117,19 @@ export default class NostrLike extends NostrBaseComponent {
       return false;
     }
 
-    const urlAttr   = this.getAttribute('url');
+    if (
+      hasInstalledRelayTransport() &&
+      !getTrustedActionContext(this)
+    ) {
+      this.likeActionStatus.set(
+        NCStatus.Error,
+        'Untrusted extension action',
+      );
+      this.likeListStatus.set(NCStatus.Error, 'Untrusted extension action');
+      return false;
+    }
+
+    const urlAttr   = this.getActionUrl();
     const textAttr  = this.getAttribute('text');
     const tagName   = this.tagName.toLowerCase();
 
@@ -147,6 +166,12 @@ export default class NostrLike extends NostrBaseComponent {
 
   /** A host relay transport replaces only networking, not the component UI/signer. */
   protected async connectToNostr() {
+    if (
+      hasInstalledRelayTransport() &&
+      !getTrustedActionContext(this)
+    ) {
+      throw new Error('Untrusted extension action');
+    }
     if (!getRelayTransport()) {
       await super.connectToNostr();
       return;
@@ -165,9 +190,17 @@ export default class NostrLike extends NostrBaseComponent {
   /**
    * Lazy initializer for currentUrl - ensures it's set before like/unlike operations
    */
+  private getActionUrl(): string {
+    return (
+      getTrustedActionContext(this)?.url ||
+      this.getAttribute('url') ||
+      window.location.href
+    );
+  }
+
   private ensureCurrentUrl(): void {
     if (!this.currentUrl) {
-      this.currentUrl = normalizeURL(this.getAttribute('url') || window.location.href);
+      this.currentUrl = normalizeURL(this.getActionUrl());
     }
   }
 
@@ -176,13 +209,32 @@ export default class NostrLike extends NostrBaseComponent {
     try {
       await this.ensureNostrConnected();
       if (seq !== this.loadSeq) return;
-      this.currentUrl = normalizeURL(this.getAttribute('url') || window.location.href);
+      this.currentUrl = normalizeURL(this.getActionUrl());
       this.likeListStatus.set(NCStatus.Loading);
       this.render();
+
+      // Extension storage is local and fast: restore the user's recent state
+      // before the bounded relay query revalidates the count in the background.
+      try {
+        const cachedIsLiked = await fetchCachedLikeStateForUrl(
+          this.currentUrl,
+          this.getRelays(),
+        );
+        if (seq !== this.loadSeq) return;
+        if (cachedIsLiked !== null) {
+          this.isLiked = cachedIsLiked;
+          this.render();
+        }
+      } catch (cacheError) {
+        console.warn('[NostrLike] Failed to restore cached like state:', cacheError);
+      }
      
       const result = await fetchLikesForUrl(this.currentUrl, this.getRelays());
       if (seq !== this.loadSeq) return; // stale
       this.likeCount = clampLikeCount(result.totalCount);
+      if (typeof result.isLiked === 'boolean') {
+        this.isLiked = result.isLiked;
+      }
       this.cachedLikeDetails = result;
       this.likeListStatus.set(NCStatus.Ready);
     } catch (error) {
@@ -237,7 +289,7 @@ export default class NostrLike extends NostrBaseComponent {
     this.queueAuthoritativeCountResync();
   }
 
-  private async handleLikeClick() {
+  async #handleLikeClick() {
     if (this.likeActionStatus.get() === NCStatus.Loading) return;
 
     // Ensure currentUrl is set before proceeding
@@ -310,10 +362,10 @@ export default class NostrLike extends NostrBaseComponent {
         }
 
         // Proceed with unlike
-        await this.handleUnlike(targetUrl);
+        await this.#handleUnlike(targetUrl);
       } else {
         // Proceed with like
-        await this.handleLike(targetUrl);
+        await this.#handleLike(targetUrl);
       }
     } catch (error) {
       console.error('[NostrLike] Failed to check user like status:', error);
@@ -323,7 +375,7 @@ export default class NostrLike extends NostrBaseComponent {
     }
   }
 
-  private async handleLike(targetUrl?: string) {
+  async #handleLike(targetUrl?: string) {
     // Ensure currentUrl is set before proceeding
     this.ensureCurrentUrl();
     const likeUrl = targetUrl ?? this.currentUrl;
@@ -363,7 +415,7 @@ export default class NostrLike extends NostrBaseComponent {
       await publishSignedReaction(signedEvent, this.getRelays(), async () => {
         const ndkEvent = new NDKEvent(this.nostrService.getNDK(), signedEvent);
         await ndkEvent.publish();
-      });
+      }, getTrustedActionContext(this)?.actionId);
 
       // Keep action locked until authoritative refresh finishes
       await this.updateLikeCount();
@@ -382,7 +434,7 @@ export default class NostrLike extends NostrBaseComponent {
     }
   }
 
-  private async handleUnlike(targetUrl?: string) {
+  async #handleUnlike(targetUrl?: string) {
     // Ensure currentUrl is set before proceeding
     this.ensureCurrentUrl();
     const unlikeUrl = targetUrl ?? this.currentUrl;
@@ -422,7 +474,7 @@ export default class NostrLike extends NostrBaseComponent {
       await publishSignedReaction(signedEvent, this.getRelays(), async () => {
         const ndkEvent = new NDKEvent(this.nostrService.getNDK(), signedEvent);
         await ndkEvent.publish();
-      });
+      }, getTrustedActionContext(this)?.actionId);
 
       // Keep action locked until authoritative refresh finishes
       await this.updateLikeCount();
@@ -441,7 +493,7 @@ export default class NostrLike extends NostrBaseComponent {
     }
   }
 
-  private async handleCountClick() {
+  async #handleCountClick() {
     if (this.likeCount === 0 || !this.cachedLikeDetails) {
       return;
     }
@@ -459,7 +511,7 @@ export default class NostrLike extends NostrBaseComponent {
     }
   }
 
-  private async handleHelpClick() {
+  async #handleHelpClick() {
     try {
       await showHelpDialog(this.theme === 'dark' ? 'dark' : 'light');
     } catch (error) {
@@ -469,28 +521,32 @@ export default class NostrLike extends NostrBaseComponent {
 
   private attachDelegatedListeners() {
     this.delegateEvent('click', '.nostr-like-button', (e) => {
+      if (!isTrustedUserEvent(e)) return;
       e.preventDefault?.();
       e.stopPropagation?.();
-      void this.handleLikeClick();
+      void this.#handleLikeClick();
     });
 
-    this.delegateEvent('click', '.like-count', (e) => {
+    this.delegateEvent('click', '.like-count.clickable', (e) => {
+      if (!isTrustedUserEvent(e)) return;
       e.preventDefault?.();
       e.stopPropagation?.();
-      void this.handleCountClick();
+      void this.#handleCountClick();
     });
 
     this.delegateEvent('keydown', '.like-count.clickable', (e: KeyboardEvent) => {
+      if (!isTrustedUserEvent(e)) return;
       if (e.key !== 'Enter' && e.key !== ' ') return;
       e.preventDefault();
       e.stopPropagation();
-      void this.handleCountClick();
+      void this.#handleCountClick();
     });
 
     this.delegateEvent('click', '.help-icon', (e) => {
+      if (!isTrustedUserEvent(e)) return;
       e.preventDefault?.();
       e.stopPropagation?.();
-      this.handleHelpClick();
+      void this.#handleHelpClick();
     });
   }
 
@@ -520,10 +576,10 @@ export default class NostrLike extends NostrBaseComponent {
       compact,
     };
 
-    this.shadowRoot!.innerHTML = `
+    setTrustedInnerHTML(this.shadowRoot!, `
       ${getLikeButtonStyles()}
       ${renderLikeButton(renderOptions)}
-    `;
+    `);
   }
 }
 

@@ -11,6 +11,10 @@ import {
 } from './zap-utils';
 import { escapeHtml, formatRelativeTime, hexToNpub } from '../common/utils';
 import { renderZapEntry, type EnhancedZapDetails } from './render-zap-entry';
+import {
+  setTrustedInnerHTML,
+  setTrustedOuterHTML,
+} from '../common/trusted-html';
 
 /**
  * Modal dialog for displaying individual zap details (zappers).
@@ -27,6 +31,7 @@ export interface OpenZappersModalParams {
   zapDetails: ZapDetails[];
   theme?: 'light' | 'dark';
   relays?: string[];
+  actionId?: string;
 }
 
 /**
@@ -79,7 +84,7 @@ function renderSkeletonZapEntry(
 export async function openZappersDialog(
   params: OpenZappersModalParams,
 ): Promise<DialogComponent> {
-  const { zapDetails, theme = 'light', relays } = params;
+  const { zapDetails, theme = 'light', relays, actionId } = params;
 
   // Inject styles
   injectZappersDialogStyles(theme);
@@ -100,7 +105,7 @@ export async function openZappersDialog(
 
   // Initial content with skeleton loaders showing npubs
   const initialContent = await renderInitialContent(zapDetails);
-  dialogComponent.innerHTML = initialContent;
+  setTrustedInnerHTML(dialogComponent, initialContent);
 
   // Show the dialog (this will create and append the actual dialog element)
   dialogComponent.showModal();
@@ -127,7 +132,12 @@ export async function openZappersDialog(
 
   // Start progressive enhancement
   if (dialog && zapDetails.length > 0) {
-    enhanceZapDetailsProgressively(dialog, zapDetails, relays);
+    enhanceZapDetailsProgressively(
+      dialog,
+      zapDetails,
+      relays,
+      actionId,
+    );
   }
 
   return dialogComponent;
@@ -170,6 +180,7 @@ async function enhanceZapDetailsProgressively(
   dialog: HTMLDialogElement,
   zapDetails: ZapDetails[],
   relays?: string[],
+  actionId?: string,
 ): Promise<void> {
   const zappersList = dialog.querySelector('.zappers-list') as HTMLElement;
   if (!zappersList) return;
@@ -189,6 +200,7 @@ async function enhanceZapDetailsProgressively(
     const profileResults = await getBatchedProfileMetadata(
       uniqueAuthorIds,
       relays,
+      actionId,
     );
 
     // Create a map for quick lookup
@@ -235,7 +247,7 @@ async function enhanceZapDetailsProgressively(
       );
       if (skeletonEntry) {
         const enhancedEntry = renderZapEntry(enhanced, index);
-        skeletonEntry.outerHTML = enhancedEntry;
+        setTrustedOuterHTML(skeletonEntry, enhancedEntry);
       }
     }
 
@@ -254,7 +266,12 @@ async function enhanceZapDetailsProgressively(
     console.log(
       'Nostr-Components: Zappers dialog: Falling back to individual profile fetching',
     );
-    await enhanceZapDetailsIndividually(dialog, zapDetails, relays);
+    await enhanceZapDetailsIndividually(
+      dialog,
+      zapDetails,
+      relays,
+      actionId,
+    );
   }
 }
 
@@ -265,6 +282,7 @@ async function enhanceZapDetailsIndividually(
   dialog: HTMLDialogElement,
   zapDetails: ZapDetails[],
   relays?: string[],
+  actionId?: string,
 ): Promise<void> {
   const zappersList = dialog.querySelector('.zappers-list') as HTMLElement;
   if (!zappersList) return;
@@ -293,6 +311,7 @@ async function enhanceZapDetailsIndividually(
       const profileMetadata = await getProfileMetadata(
         zap.authorPubkey,
         relays,
+        actionId,
       );
       const profileContent = extractProfileMetadataContent(profileMetadata);
       const npub = hexToNpub(zap.authorPubkey);
@@ -346,7 +365,7 @@ async function enhanceZapDetailsIndividually(
       );
       if (skeletonEntry) {
         const enhancedEntry = renderZapEntry(enhanced, index);
-        skeletonEntry.outerHTML = enhancedEntry;
+        setTrustedOuterHTML(skeletonEntry, enhancedEntry);
       }
     } catch (error) {
       console.error(

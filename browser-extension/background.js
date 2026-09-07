@@ -1,150 +1,14 @@
 // SPDX-License-Identifier: MIT
 
+if (typeof importScripts === 'function') {
+  importScripts('lib/zap-http.js');
+}
+
 const DIRECTORY_LOOKUP_ENDPOINT =
   'https://us-central1-gr-prod.cloudfunctions.net/lookupDirectoryHandle';
 const LOOKUP_TIMEOUT_MS = 5000;
-const RELAY_CHANNEL_PATTERN = /^[0-9a-f]{64}$/;
-
-function getXExecutionTarget(sender) {
-  if (
-    !sender ||
-    !sender.tab ||
-    !Number.isInteger(sender.tab.id) ||
-    !chrome.scripting ||
-    typeof chrome.scripting.executeScript !== 'function'
-  ) {
-    throw new Error('Like component injection is unavailable');
-  }
-
-  if (typeof sender.url !== 'string' || !Number.isInteger(sender.frameId)) {
-    throw new Error('Like component injection requires a validated sender frame');
-  }
-
-  const senderUrl = new URL(sender.url);
-  if (
-    senderUrl.protocol !== 'https:' ||
-    senderUrl.port !== '' ||
-    (senderUrl.hostname !== 'x.com' && senderUrl.hostname !== 'twitter.com')
-  ) {
-    throw new Error('Like component injection is restricted to X/Twitter');
-  }
-
-  return { tabId: sender.tab.id, frameIds: [sender.frameId] };
-}
-
-function installRelayTransport(channel) {
-  const requestSource = 'nostr-components-relay-main';
-  const responseSource = 'nostr-components-relay-extension';
-  const transportKey = '__nostrComponentsRelayTransport';
-  const existing = globalThis[transportKey];
-  if (existing && existing.__channel === channel) return;
-  if (existing && typeof existing.__dispose === 'function') {
-    existing.__dispose();
-  }
-
-  const pending = new Map();
-
-  function createRequestId() {
-    const bytes = new Uint8Array(16);
-    crypto.getRandomValues(bytes);
-    return Array.from(bytes, function (value) {
-      return value.toString(16).padStart(2, '0');
-    }).join('');
-  }
-
-  function onMessage(event) {
-    const message = event.data;
-    if (
-      event.source !== window ||
-      event.origin !== window.location.origin ||
-      !message ||
-      message.source !== responseSource ||
-      message.channel !== channel ||
-      !pending.has(message.requestId)
-    ) {
-      return;
-    }
-
-    const request = pending.get(message.requestId);
-    pending.delete(message.requestId);
-    clearTimeout(request.timeoutId);
-    if (message.ok === true) {
-      request.resolve(message.result);
-    } else {
-      request.reject(new Error(message.error || 'Relay request failed'));
-    }
-  }
-
-  function request(operation, payload) {
-    return new Promise(function (resolve, reject) {
-      const requestId = createRequestId();
-      const timeoutId = setTimeout(
-        function () {
-          pending.delete(requestId);
-          reject(new Error('Relay request timed out'));
-        },
-        operation === 'publish' ? 12000 : 4000
-      );
-      pending.set(requestId, {
-        resolve: resolve,
-        reject: reject,
-        timeoutId: timeoutId
-      });
-      window.postMessage(
-        {
-          source: requestSource,
-          channel: channel,
-          requestId: requestId,
-          operation: operation,
-          payload: payload
-        },
-        window.location.origin
-      );
-    });
-  }
-
-  window.addEventListener('message', onMessage);
-  globalThis[transportKey] = Object.freeze({
-    __channel: channel,
-    query: function (relays, filter) {
-      return request('query', { relays: relays, filter: filter });
-    },
-    getLikeState: function (relays, url) {
-      return request('getLikeState', { relays: relays, url: url });
-    },
-    publish: function (relays, event) {
-      return request('publish', { relays: relays, event: event });
-    },
-    __dispose: function () {
-      window.removeEventListener('message', onMessage);
-      for (const request of pending.values()) {
-        clearTimeout(request.timeoutId);
-        request.reject(new Error('Relay transport was replaced'));
-      }
-      pending.clear();
-    }
-  });
-}
-
-async function injectLikeComponent(message, sender) {
-  if (!RELAY_CHANNEL_PATTERN.test(String(message.channel || ''))) {
-    throw new Error('Invalid relay bridge channel');
-  }
-
-  const target = getXExecutionTarget(sender);
-  await chrome.scripting.executeScript({
-    target: target,
-    func: installRelayTransport,
-    args: [message.channel],
-    world: 'MAIN'
-  });
-  await chrome.scripting.executeScript({
-    target: target,
-    files: ['lib/nostr-like-button.js'],
-    world: 'MAIN'
-  });
-  return true;
-}
+const ZAP_HTTP_TIMEOUT_MS = 10000;
+const ZAP_HTTP_MAX_BYTES = 64 * 1024;
 
 function normalizeHandle(value) {
   const handle = String(value || '').trim().replace(/^@/, '').toLowerCase();
@@ -187,6 +51,64 @@ async function lookupDirectoryHandle(message) {
   }
 }
 
+function isAllowedRequestSender(sender) {
+  if (!sender || typeof sender.url !== 'string') return false;
+  try {
+    const senderUrl = new URL(sender.url);
+    return (
+      senderUrl.protocol === 'https:' &&
+      senderUrl.port === '' &&
+      [
+        'x.com',
+        'twitter.com',
+        'www.youtube.com',
+        'm.youtube.com',
+        'youtube.com'
+      ].includes(senderUrl.hostname)
+    );
+  } catch (_error) {
+    return false;
+  }
+}
+
+async function fetchHttpsJson(message, sender) {
+  if (!isAllowedRequestSender(sender)) {
+    throw new Error('HTTPS fetch is restricted to supported sites');
+  }
+
+  const normalized = globalThis.NostrLikeExtension?.zapHttp?.normalizeZapHttpUrl(message.url);
+  if (!normalized) {
+    throw new Error('HTTPS request contains an unsupported URL');
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(function () {
+    controller.abort();
+  }, ZAP_HTTP_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(normalized, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      redirect: 'error',
+      signal: controller.signal
+    });
+    const text = await response.text();
+    if (text.length > ZAP_HTTP_MAX_BYTES) {
+      throw new Error('HTTPS response is too large');
+    }
+    let json = null;
+    try {
+      json = JSON.parse(text);
+    } catch (_error) {
+      throw new Error('Invalid JSON from HTTPS endpoint');
+    }
+    return { status: response.status, json: json };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
   if (!message) {
     return false;
@@ -195,8 +117,8 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
   let operation;
   if (message.type === 'LOOKUP_DIRECTORY_HANDLE') {
     operation = lookupDirectoryHandle(message);
-  } else if (message.type === 'INJECT_NOSTR_LIKE_COMPONENT') {
-    operation = injectLikeComponent(message, sender);
+  } else if (message.type === 'FETCH_HTTPS_JSON') {
+    operation = fetchHttpsJson(message, sender);
   } else {
     return false;
   }

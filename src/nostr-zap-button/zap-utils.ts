@@ -7,10 +7,14 @@ import {
   SimplePool,
 } from 'nostr-tools';
 import type { Filter, Event } from 'nostr-tools';
+import { normalizeURL as normalizeRelayURL } from 'nostr-tools/utils';
 import { normalizeURL } from '../common/utils';
 import { ensureInitialized, signEvent as signEventWithNostrLogin } from '../common/nostr-login-service';
 import { DEFAULT_RELAYS } from '../common/constants';
+import { getRelayTransport, httpGetJson } from '../common/relay-transport';
+import { cloneVerifiedEvent } from '../common/nostr-event';
 import {
+  getBolt11AmountMsats,
   resolveZapProviderInfo,
   validateZapReceipt,
   type ZapProviderInfo,
@@ -23,65 +27,172 @@ import {
  */
 
 // Basic in-memory cache – sufficient for component lifetime.
-const profileCache: Record<string, any> = {};
+const profileCache = new Map<string, Event>();
 const ZAP_PROVIDER_CACHE_TTL_MS = 5 * 60 * 1000;
 const ZAP_PROVIDER_NEGATIVE_TTL_MS = 30 * 1000;
+const ZAP_RECEIPT_POLL_TIMEOUT_MS = 10 * 60 * 1000;
 const zapProviderCache: Record<
   string,
   { value: ZapProviderInfo | null; expiresAt: number }
 > = {};
 
-export const getProfileMetadata = async (authorId: string, relays?: string[]) => {
-  if (profileCache[authorId]) return profileCache[authorId];
+const profileCacheKey = (authorId: string, relays: string[]) => {
+  const normalizedRelays = Array.from(
+    new Set(
+      relays.map(relay => {
+        try {
+          return normalizeRelayURL(relay);
+        } catch {
+          return relay;
+        }
+      }),
+    ),
+  ).sort();
+  return `${authorId.toLowerCase()}|${normalizedRelays.join(',')}`;
+};
+
+const getVerifiedProfileEvent = (
+  event: unknown,
+  expectedAuthorId: string,
+): Event | null => {
+  const profile = cloneVerifiedEvent(event);
+  if (!profile) return null;
+  if (
+    profile.kind !== 0 ||
+    profile.pubkey.toLowerCase() !== expectedAuthorId.toLowerCase()
+  ) {
+    return null;
+  }
+  return profile;
+};
+
+export const getProfileMetadata = async (
+  authorId: string,
+  relays?: string[],
+  actionId?: string,
+) => {
+  const relayList = relays && relays.length > 0 ? relays : [...DEFAULT_RELAYS];
+  const cacheKey = profileCacheKey(authorId, relayList);
+  const cached = profileCache.get(cacheKey);
+  if (cached) return cached;
+
+  const transport = getRelayTransport();
+  if (transport) {
+    const filter = {
+      authors: [authorId],
+      kinds: [0],
+      limit: 1,
+    };
+    const events = actionId
+      ? await transport.query(relayList, filter, actionId)
+      : await transport.query(relayList, filter);
+    const event =
+      [...events]
+        .map(candidate => getVerifiedProfileEvent(candidate, authorId))
+        .filter((candidate): candidate is Event => candidate !== null)
+        .sort(
+          (left, right) =>
+            right.created_at - left.created_at ||
+            left.id.localeCompare(right.id),
+        )[0] || null;
+    if (event) profileCache.set(cacheKey, event);
+    return event;
+  }
 
   const pool = new SimplePool();
-  const relayList = relays && relays.length > 0 ? relays : [...DEFAULT_RELAYS];
-
   try {
     const event = await pool.get(relayList, {
       authors: [authorId],
       kinds: [0],
     });
-    profileCache[authorId] = event;
-    return event;
+    const verifiedEvent = getVerifiedProfileEvent(event, authorId);
+    if (verifiedEvent) profileCache.set(cacheKey, verifiedEvent);
+    return verifiedEvent;
   } finally {
     pool.close(relayList);
   }
 };
 
-export const getBatchedProfileMetadata = async (authorIds: string[], relays?: string[]) => {
-  // Filter out already cached profiles
-  const uncachedIds = authorIds.filter(id => !profileCache[id]);
+const PROFILE_QUERY_BATCH_SIZE = 50;
+
+function cacheVerifiedProfiles(
+  events: unknown[],
+  requestedIds: Set<string>,
+  relayList: string[],
+) {
+  for (const event of events) {
+    const candidate = event as Partial<Event> | null;
+    const verifiedEvent = getVerifiedProfileEvent(
+      candidate,
+      candidate?.pubkey || '',
+    );
+    if (!verifiedEvent) continue;
+    if (!requestedIds.has(verifiedEvent.pubkey.toLowerCase())) continue;
+
+    const cacheKey = profileCacheKey(verifiedEvent.pubkey, relayList);
+    const cached = profileCache.get(cacheKey);
+    if (
+      !cached ||
+      verifiedEvent.created_at > cached.created_at ||
+      (verifiedEvent.created_at === cached.created_at &&
+        verifiedEvent.id < cached.id)
+    ) {
+      profileCache.set(cacheKey, verifiedEvent);
+    }
+  }
+}
+
+export const getBatchedProfileMetadata = async (
+  authorIds: string[],
+  relays?: string[],
+  actionId?: string,
+) => {
+  const relayList = relays && relays.length > 0 ? relays : [...DEFAULT_RELAYS];
+  const uncachedIds = Array.from(
+    new Set(
+      authorIds.map(id => id.toLowerCase()).filter(
+        id => !profileCache.has(profileCacheKey(id, relayList)),
+      ),
+    ),
+  );
 
   // If all profiles are cached, return them
   if (uncachedIds.length === 0) {
-    return authorIds.map(id => ({ id, profile: profileCache[id] }));
+    return authorIds.map(id => ({
+      id,
+      profile: profileCache.get(profileCacheKey(id, relayList)) || null,
+    }));
   }
 
-  const pool = new SimplePool();
-  const relayList = relays && relays.length > 0 ? relays : [...DEFAULT_RELAYS];
-
+  const transport = getRelayTransport();
+  const pool = transport ? null : new SimplePool();
+  const requestedIds = new Set(uncachedIds);
   try {
-    // Fetch all uncached profiles in a single query
-    const events = await pool.querySync(relayList, {
-      authors: uncachedIds,
-      kinds: [0],
-    });
+    for (
+      let offset = 0;
+      offset < uncachedIds.length;
+      offset += PROFILE_QUERY_BATCH_SIZE
+    ) {
+      const batch = uncachedIds.slice(offset, offset + PROFILE_QUERY_BATCH_SIZE);
+      const filter = {
+        authors: batch,
+        kinds: [0],
+        limit: batch.length,
+      };
+        const events = transport
+          ? actionId
+            ? await transport.query(relayList, filter, actionId)
+            : await transport.query(relayList, filter)
+        : await pool!.querySync(relayList, filter);
+      cacheVerifiedProfiles(events, requestedIds, relayList);
+    }
 
-    // Cache the fetched profiles
-    events.forEach(event => {
-      profileCache[event.pubkey] = event;
-    });
-
-    // Combine cached and newly fetched profiles
-    const allProfiles = authorIds.map(id => ({
+    return authorIds.map(id => ({
       id,
-      profile: profileCache[id] || null
+      profile: profileCache.get(profileCacheKey(id, relayList)) || null,
     }));
-
-    return allProfiles;
   } finally {
-    pool.close(relayList);
+    pool?.close(relayList);
   }
 };
 
@@ -102,13 +213,18 @@ export const getZapEndpoint = async (profileMetadata: any) => {
 export const getZapProviderInfo = async (
   profileMetadata: Event,
 ): Promise<ZapProviderInfo | null> => {
-  const cacheKey = profileMetadata.pubkey || profileMetadata.id || '';
+  const verifiedProfile = getVerifiedProfileEvent(
+    profileMetadata,
+    profileMetadata?.pubkey || '',
+  );
+  if (!verifiedProfile) return null;
+  const cacheKey = verifiedProfile.pubkey || verifiedProfile.id || '';
   const cached = cacheKey ? zapProviderCache[cacheKey] : undefined;
   if (cached && cached.expiresAt > Date.now()) {
     return cached.value;
   }
 
-  const provider = await resolveZapProviderInfo(profileMetadata);
+  const provider = await resolveZapProviderInfo(verifiedProfile);
   if (cacheKey) {
     const ttl = provider ? ZAP_PROVIDER_CACHE_TTL_MS : ZAP_PROVIDER_NEGATIVE_TTL_MS;
     zapProviderCache[cacheKey] = {
@@ -199,6 +315,46 @@ const makeZapEvent = async ({
   return signEvent(event, anon);
 };
 
+export const fetchInvoiceForAction = async ({
+  actionId,
+  amount,
+  comment,
+  authorId,
+  normalizedRelays,
+  anon,
+  url,
+}: {
+  actionId: string;
+  amount: number;
+  comment?: string;
+  authorId: string;
+  normalizedRelays: string[];
+  anon?: boolean;
+  url: string;
+}): Promise<{
+  invoice: string;
+  provider: ZapProviderInfo;
+}> => {
+  const transport = getRelayTransport();
+  if (!transport?.fetchZapInvoice) {
+    throw new Error('Trusted Zap transport is unavailable');
+  }
+  const zapEvent = await makeZapEvent({
+    profile: authorId,
+    amount,
+    relays: normalizedRelays,
+    comment: comment ?? '',
+    anon,
+    url,
+  });
+  return transport.fetchZapInvoice(actionId, {
+    relays: normalizedRelays,
+    amount,
+    comment: comment ?? '',
+    zapEvent,
+  });
+};
+
 export const fetchInvoice = async ({
   zapEndpoint,
   amount,
@@ -231,19 +387,25 @@ export const fetchInvoice = async ({
   )}`;
   if (comment) invoiceUrl += `&comment=${encodeURIComponent(comment ?? '')}`;
 
-  const res = await fetch(invoiceUrl, { method: 'GET' });
-  if (!res.ok) {
-    throw new Error(`LNURL request failed: ${res.status} ${res.statusText}`);
+  const { status, json } = await httpGetJson(invoiceUrl);
+  if (status < 200 || status >= 300) {
+    throw new Error(`LNURL request failed: ${status}`);
   }
-  let json: any;
-  try {
-    json = await res.json();
-  } catch {
+  if (json == null || typeof json !== 'object') {
     throw new Error('Invalid JSON from LNURL endpoint');
   }
-  const { pr: invoice, reason, status } = json || {};
-  if (invoice) return invoice;
-  if (status === 'ERROR') throw new Error(reason ?? 'Unable to fetch invoice');
+  const { pr: invoice, reason, status: lnurlStatus } = json || {};
+  if (typeof invoice === 'string' && invoice.length > 0) {
+    const invoiceAmount = getBolt11AmountMsats(invoice);
+    if (invoiceAmount == null) {
+      throw new Error('LNURL endpoint returned an invalid invoice');
+    }
+    if (invoiceAmount !== amount) {
+      throw new Error('LNURL invoice amount does not match requested amount');
+    }
+    return invoice;
+  }
+  if (lnurlStatus === 'ERROR') throw new Error(reason ?? 'Unable to fetch invoice');
   throw new Error('Unable to fetch invoice');
 };
 
@@ -317,22 +479,29 @@ export const fetchTotalZapAmount = async ({
   pubkey,
   relays,
   url,
+  actionId,
 }: {
   pubkey: string;
   relays: string[];
   url?: string;
+  actionId?: string;
 }): Promise<ZapAmountResult> => {
-  const pool = new SimplePool();
+  const transport = getRelayTransport();
+  const pool = transport ? null : new SimplePool();
   let totalAmount = 0;
   const zapDetails: ZapDetails[] = [];
 
   try {
-    const profileMetadata = await getProfileMetadata(pubkey, relays);
-    if (!profileMetadata) {
-      return { totalAmount: 0, zapDetails: [] };
+    let provider: ZapProviderInfo | null = null;
+    if (actionId && transport?.getZapProvider) {
+      provider = await transport.getZapProvider(actionId, relays);
+    } else {
+      const profileMetadata = await getProfileMetadata(pubkey, relays);
+      if (!profileMetadata) {
+        return { totalAmount: 0, zapDetails: [] };
+      }
+      provider = await getZapProviderInfo(profileMetadata);
     }
-
-    const provider = await getZapProviderInfo(profileMetadata);
     if (!provider) {
       // Fail closed: without LNURL nostrPubkey we cannot authenticate receipts.
       return { totalAmount: 0, zapDetails: [] };
@@ -343,21 +512,25 @@ export const fetchTotalZapAmount = async ({
       '#p': [pubkey],
       limit: 1000,
     };
+    const expectedATag = url ? buildUrlATag(pubkey, url) : undefined;
 
     // When a URL is provided, filter at the relay level using the #a tag.
     // The a tag value (39735:pubkey:url) is copied from the zap request to the
     // zap receipt by NIP-57-compliant relays, so only URL-specific receipts
     // are returned — no client-side description parsing needed for filtering.
-    if (url) {
-      filter['#a'] = [buildUrlATag(pubkey, url)];
+    if (expectedATag) {
+      filter['#a'] = [expectedATag];
     }
 
-    const events = await pool.querySync(relays, filter);
+    const events = transport
+      ? await transport.query(relays, filter)
+      : await pool!.querySync(relays, filter);
 
     for (const event of events) {
       const validated = validateZapReceipt(event, {
         recipientPubkey: pubkey,
         provider,
+        expectedATag,
       });
       if (!validated.ok) continue;
 
@@ -372,7 +545,7 @@ export const fetchTotalZapAmount = async ({
   } catch (error) {
     console.error("Nostr-Components: Zap button: Error fetching zap receipts", error);
   } finally {
-    pool.close(relays);
+    pool?.close(relays);
   }
 
   // Sort zap details by date (newest first)
@@ -389,17 +562,77 @@ export const listenForZapReceipt = ({
   receiversPubKey,
   invoice,
   provider,
+  url,
   onSuccess,
 }: {
   relays: string[];
   receiversPubKey: string;
   invoice: string;
   provider: ZapProviderInfo;
+  url?: string;
   onSuccess: () => void;
 }) => {
-  const pool = new SimplePool();
   const normalizedRelays = Array.from(new Set(relays));
   const since = Math.floor((Date.now() - 24 * 60 * 60 * 1000) / 1000); // current time - 24 hours
+  const transport = getRelayTransport();
+  const expectedATag = url
+    ? buildUrlATag(receiversPubKey, url)
+    : undefined;
+
+  if (transport) {
+    let stopped = false;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    const deadlineAt = Date.now() + ZAP_RECEIPT_POLL_TIMEOUT_MS;
+
+    const poll = async () => {
+      if (stopped || Date.now() >= deadlineAt) {
+        stopped = true;
+        return;
+      }
+      try {
+        const events = await transport.query(normalizedRelays, {
+          kinds: [9735],
+          '#p': [receiversPubKey],
+          since,
+          limit: 100,
+        });
+        if (stopped || Date.now() >= deadlineAt) {
+          stopped = true;
+          return;
+        }
+        for (const event of events) {
+          const tags = event.tags as [string, string][];
+          if (!tags.some(t => t[0] === 'bolt11' && t[1] === invoice)) continue;
+          const validated = validateZapReceipt(event, {
+            recipientPubkey: receiversPubKey,
+            provider,
+            expectedATag,
+            expectedBolt11: invoice,
+          });
+          if (!validated.ok) continue;
+          stopped = true;
+          onSuccess();
+          return;
+        }
+      } catch {
+        // A relay quorum may be temporarily unavailable while the wallet is open.
+      }
+      const remainingMs = deadlineAt - Date.now();
+      if (!stopped && remainingMs > 0) {
+        timeoutId = setTimeout(poll, Math.min(3000, remainingMs));
+      } else {
+        stopped = true;
+      }
+    };
+
+    void poll();
+    return () => {
+      stopped = true;
+      if (timeoutId) clearTimeout(timeoutId);
+    };
+  }
+
+  const pool = new SimplePool();
 
   pool.subscribe(
     normalizedRelays,
@@ -418,6 +651,8 @@ export const listenForZapReceipt = ({
         const validated = validateZapReceipt(event, {
           recipientPubkey: receiversPubKey,
           provider,
+          expectedATag,
+          expectedBolt11: invoice,
         });
         if (!validated.ok) return;
 

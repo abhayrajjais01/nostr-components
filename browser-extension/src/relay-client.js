@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: MIT
 
-import { SimplePool, verifyEvent } from 'nostr-tools';
+import { SimplePool, nip19, verifyEvent } from 'nostr-tools';
 import { normalizeURL } from 'nostr-tools/utils';
+import { bech32 } from '@scure/base';
+import { decode as decodeBolt11 } from 'light-bolt11-decoder';
 
 (function () {
   const extension = globalThis.NostrLikeExtension = globalThis.NostrLikeExtension || {};
   const REQUEST_SOURCE = 'nostr-components-relay-main';
   const RESPONSE_SOURCE = 'nostr-components-relay-extension';
   const CHANNEL_PATTERN = /^[0-9a-f]{64}$/;
+  const ACTION_ID_PATTERN = /^[0-9a-f]{64}$/;
   const REQUEST_ID_PATTERN = /^[0-9a-f]{32}$/;
+  const MESSAGE_MAC_PATTERN = /^[0-9a-f]{64}$/;
+  const BRIDGE_AUTH_CONTEXT = 'nostr-components-relay-v2';
   const HEX_64_PATTERN = /^[0-9a-f]{64}$/i;
   const HEX_128_PATTERN = /^[0-9a-f]{128}$/i;
   const QUERY_DEADLINE_MS = 2500;
@@ -42,8 +47,139 @@ import { normalizeURL } from 'nostr-tools/utils';
   let activeSession = null;
   const relayHealth = new Map();
   const recentReactionsByUrl = new Map();
+  const actionContexts = new Map();
 
-  function rememberRecentReaction(event) {
+  function canonicalJson(value) {
+    if (value === null) return 'null';
+    if (typeof value === 'string' || typeof value === 'number') {
+      const serialized = JSON.stringify(value);
+      if (serialized === undefined) {
+        throw new Error('Relay bridge value is not serializable');
+      }
+      return serialized;
+    }
+    if (typeof value === 'boolean') return value ? 'true' : 'false';
+    if (Array.isArray(value)) {
+      const items = [];
+      for (let index = 0; index < value.length; index += 1) {
+        items.push(
+          Object.hasOwn(value, index) && value[index] !== undefined
+            ? canonicalJson(value[index])
+            : 'null'
+        );
+      }
+      return '[' + items.join(',') + ']';
+    }
+    if (!value || typeof value !== 'object') {
+      throw new Error('Relay bridge value is not serializable');
+    }
+    const entries = [];
+    for (const key of Object.keys(value).sort()) {
+      if (value[key] === undefined) continue;
+      entries.push(JSON.stringify(key) + ':' + canonicalJson(value[key]));
+    }
+    return '{' + entries.join(',') + '}';
+  }
+
+  function bridgeAuthPayload(type, message) {
+    if (type === 'request') {
+      return canonicalJson([
+        BRIDGE_AUTH_CONTEXT,
+        'request',
+        message.requestId,
+        message.operation,
+        message.payload
+      ]);
+    }
+    return canonicalJson([
+      BRIDGE_AUTH_CONTEXT,
+      'response',
+      message.requestId,
+      message.requestMac,
+      message.operation,
+      message.ok === true,
+      message.ok === true ? message.result : null,
+      message.ok === true ? null : String(message.error || 'Relay request failed')
+    ]);
+  }
+
+  function hexToBytes(value) {
+    const bytes = new Uint8Array(value.length / 2);
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Number.parseInt(value.slice(index * 2, index * 2 + 2), 16);
+    }
+    return bytes;
+  }
+
+  function bytesToHex(value) {
+    return Array.from(new Uint8Array(value), function (byte) {
+      return byte.toString(16).padStart(2, '0');
+    }).join('');
+  }
+
+  function cloneBridgeValue(value) {
+    if (typeof globalThis.structuredClone === 'function') {
+      return globalThis.structuredClone(value);
+    }
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  function createBridgeAuthenticator(channel) {
+    if (!CHANNEL_PATTERN.test(String(channel || ''))) {
+      throw new Error('Invalid relay bridge channel');
+    }
+    if (!globalThis.crypto?.subtle) {
+      throw new Error('Web Crypto is required for the relay bridge');
+    }
+
+    const subtle = globalThis.crypto.subtle;
+    const encoder = new TextEncoder();
+    const keyPromise = subtle.importKey(
+      'raw',
+      hexToBytes(channel),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign', 'verify']
+    );
+
+    async function sign(type, message) {
+      const key = await keyPromise;
+      const mac = await subtle.sign(
+        'HMAC',
+        key,
+        encoder.encode(bridgeAuthPayload(type, message))
+      );
+      return bytesToHex(mac);
+    }
+
+    async function verify(type, message) {
+      if (!MESSAGE_MAC_PATTERN.test(String(message?.mac || ''))) return false;
+      const key = await keyPromise;
+      return subtle.verify(
+        'HMAC',
+        key,
+        hexToBytes(message.mac),
+        encoder.encode(bridgeAuthPayload(type, message))
+      );
+    }
+
+    return Object.freeze({
+      signRequest: function (message) {
+        return sign('request', message);
+      },
+      verifyRequest: function (message) {
+        return verify('request', message);
+      },
+      signResponse: function (message) {
+        return sign('response', message);
+      },
+      verifyResponse: function (message) {
+        return verify('response', message);
+      }
+    });
+  }
+
+  async function rememberRecentReaction(event) {
     const identifierTag = event.tags.find((tag) => Array.isArray(tag) && tag[0] === 'i');
     const url = identifierTag?.[1];
     if (!url) return;
@@ -56,9 +192,16 @@ import { normalizeURL } from 'nostr-tools/utils';
       event: event,
       expiresAt: Date.now() + RECENT_REACTION_TTL_MS
     });
+    if (typeof extension.storage.setRecentReaction === 'function') {
+      try {
+        await extension.storage.setRecentReaction(event, RECENT_REACTION_TTL_MS);
+      } catch (_error) {
+        // A relay-acknowledged publish stays successful if local caching fails.
+      }
+    }
   }
 
-  function getRecentReactions(url) {
+  function getInMemoryRecentReactions(url) {
     const reactionsByPubkey = recentReactionsByUrl.get(url);
     if (!reactionsByPubkey) return [];
     const now = Date.now();
@@ -69,6 +212,22 @@ import { normalizeURL } from 'nostr-tools/utils';
     }
     if (reactionsByPubkey.size === 0) recentReactionsByUrl.delete(url);
     return events;
+  }
+
+  async function getRecentReactions(url) {
+    const storedEvents = typeof extension.storage.getRecentReactions === 'function'
+      ? await extension.storage.getRecentReactions(url)
+      : [];
+    const eventsById = new Map();
+    for (const event of [...getInMemoryRecentReactions(url), ...storedEvents]) {
+      const validated = validateReactionEvent(event);
+      if (!validated) continue;
+      const identifierTag = validated.tags.find(
+        (tag) => Array.isArray(tag) && tag[0] === 'i'
+      );
+      if (identifierTag?.[1] === url) eventsById.set(validated.id, validated);
+    }
+    return Array.from(eventsById.values());
   }
 
   function relayScore(relay) {
@@ -106,6 +265,15 @@ import { normalizeURL } from 'nostr-tools/utils';
       else if (event.content === '+' || event.content === '') likedCount += 1;
     }
     return { totalCount: likedCount, likedCount, dislikedCount };
+  }
+
+  function findLatestReaction(events, publicKey) {
+    if (!publicKey) return undefined;
+    return events
+      .filter((event) => event.pubkey === publicKey)
+      .sort(
+        (a, b) => b.created_at - a.created_at || (a.id === b.id ? 0 : a.id > b.id ? -1 : 1)
+      )[0];
   }
 
   function queryWithFastQuorum(pool, relays, filters) {
@@ -190,23 +358,36 @@ import { normalizeURL } from 'nostr-tools/utils';
     });
   }
 
-  function isAllowedStatusUrl(value) {
+  function isAllowedContentUrl(value) {
     try {
       const url = new URL(value);
+      if (
+        url.protocol !== 'https:' ||
+        url.port !== '' ||
+        url.username !== '' ||
+        url.password !== '' ||
+        url.hash !== ''
+      ) {
+        return false;
+      }
+      if (url.hostname === 'x.com' || url.hostname === 'twitter.com') {
+        return /^\/[^/]+\/status\/\d+\/?$/.test(url.pathname) && url.search === '';
+      }
+      if (url.hostname !== 'www.youtube.com' || url.pathname !== '/watch') {
+        return false;
+      }
+      const keys = Array.from(url.searchParams.keys());
       return (
-        url.protocol === 'https:' &&
-        (url.hostname === 'x.com' || url.hostname === 'twitter.com') &&
-        /^\/[^/]+\/status\/\d+\/?$/.test(url.pathname) &&
-        url.port === '' &&
-        url.username === '' &&
-        url.password === '' &&
-        url.search === '' &&
-        url.hash === ''
+        keys.length === 1 &&
+        keys[0] === 'v' &&
+        /^[A-Za-z0-9_-]{11}$/.test(url.searchParams.get('v') || '')
       );
     } catch (_error) {
       return false;
     }
   }
+
+  const isAllowedStatusUrl = isAllowedContentUrl;
 
   function validateRelays(value) {
     if (!Array.isArray(value) || value.length === 0 || value.length > 8) {
@@ -235,20 +416,79 @@ import { normalizeURL } from 'nostr-tools/utils';
       return null;
     }
 
+    if (!Array.isArray(value.kinds) || value.kinds.length !== 1) {
+      return null;
+    }
+
+    if (value.kinds[0] === 0) {
+      const allowedKeys = new Set(['kinds', 'authors', 'limit']);
+      if (
+        Object.keys(value).some((key) => !allowedKeys.has(key)) ||
+        !Array.isArray(value.authors) ||
+        value.authors.length < 1 ||
+        value.authors.length > 50 ||
+        value.authors.some((author) => !HEX_64_PATTERN.test(String(author))) ||
+        new Set(value.authors.map((author) => String(author).toLowerCase())).size !== value.authors.length ||
+        !Number.isInteger(value.limit) ||
+        value.limit < 1 ||
+        value.limit > 50
+      ) {
+        return null;
+      }
+      return {
+        kinds: [0],
+        authors: value.authors.map((author) => String(author).toLowerCase()),
+        limit: value.limit
+      };
+    }
+
+    if (value.kinds[0] === 9735) {
+      const allowedKeys = new Set(['kinds', '#p', '#a', 'since', 'limit']);
+      if (
+        Object.keys(value).some((key) => !allowedKeys.has(key)) ||
+        !Array.isArray(value['#p']) ||
+        value['#p'].length !== 1 ||
+        !HEX_64_PATTERN.test(String(value['#p'][0])) ||
+        !Number.isInteger(value.limit) ||
+        value.limit < 1 ||
+        value.limit > 1000 ||
+        (value.since !== undefined &&
+          (!Number.isInteger(value.since) || value.since < 0))
+      ) {
+        return null;
+      }
+
+      const pubkey = String(value['#p'][0]).toLowerCase();
+      if (value['#a'] !== undefined) {
+        if (!Array.isArray(value['#a']) || value['#a'].length !== 1) return null;
+        const prefix = '39735:' + pubkey + ':';
+        const aTag = String(value['#a'][0]);
+        if (!aTag.startsWith(prefix) || !isAllowedContentUrl(aTag.slice(prefix.length))) {
+          return null;
+        }
+      }
+
+      return {
+        kinds: [9735],
+        '#p': [pubkey],
+        ...(value['#a'] ? { '#a': [String(value['#a'][0])] } : {}),
+        ...(value.since !== undefined ? { since: value.since } : {}),
+        limit: value.limit
+      };
+    }
+
     const allowedKeys = new Set(['kinds', '#k', '#i', 'authors', 'limit']);
     if (Object.keys(value).some((key) => !allowedKeys.has(key))) {
       return null;
     }
     if (
-      !Array.isArray(value.kinds) ||
-      value.kinds.length !== 1 ||
       value.kinds[0] !== 17 ||
       !Array.isArray(value['#k']) ||
       value['#k'].length !== 1 ||
       value['#k'][0] !== 'web' ||
       !Array.isArray(value['#i']) ||
       value['#i'].length !== 1 ||
-      !isAllowedStatusUrl(value['#i'][0]) ||
+      !isAllowedContentUrl(value['#i'][0]) ||
       !Number.isInteger(value.limit) ||
       value.limit < 1 ||
       value.limit > 1000
@@ -274,7 +514,7 @@ import { normalizeURL } from 'nostr-tools/utils';
     };
   }
 
-  function validateReactionEvent(event) {
+  function validateReactionEvent(event, expectedUrl) {
     if (
       !event ||
       typeof event !== 'object' ||
@@ -301,7 +541,8 @@ import { normalizeURL } from 'nostr-tools/utils';
       kindTags.length !== 1 ||
       kindTags[0][1] !== 'web' ||
       identifierTags.length !== 1 ||
-      !isAllowedStatusUrl(identifierTags[0][1]) ||
+      !isAllowedContentUrl(identifierTags[0][1]) ||
+      (expectedUrl && identifierTags[0][1] !== expectedUrl) ||
       !verifyEvent(event)
     ) {
       return null;
@@ -310,17 +551,382 @@ import { normalizeURL } from 'nostr-tools/utils';
     return event;
   }
 
+  function decodeRecipientNpub(value) {
+    if (!value) return null;
+    try {
+      const decoded = nip19.decode(value);
+      return decoded.type === 'npub' &&
+        HEX_64_PATTERN.test(String(decoded.data || ''))
+        ? String(decoded.data).toLowerCase()
+        : null;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function registerActionContext(actionId, context) {
+    if (
+      !ACTION_ID_PATTERN.test(String(actionId || '')) ||
+      !context ||
+      (context.kind !== 'x' && context.kind !== 'youtube') ||
+      !isAllowedContentUrl(context.url)
+    ) {
+      throw new Error('Invalid isolated action context');
+    }
+    const next = {
+      kind: context.kind,
+      url: context.url,
+      recipientPubkey: decodeRecipientNpub(context.recipientNpub)
+    };
+    const current = actionContexts.get(actionId);
+    if (
+      current &&
+      current.kind === next.kind &&
+      current.url === next.url &&
+      current.recipientPubkey === next.recipientPubkey
+    ) {
+      actionContexts.delete(actionId);
+      actionContexts.set(actionId, current);
+      return;
+    }
+    actionContexts.set(actionId, next);
+    if (actionContexts.size > 2048) {
+      actionContexts.delete(actionContexts.keys().next().value);
+    }
+  }
+
+  function revokeActionContext(actionId) {
+    if (ACTION_ID_PATTERN.test(String(actionId || ''))) {
+      actionContexts.delete(actionId);
+    }
+  }
+
   function isAllowedPageOrigin(origin) {
     try {
       const url = new URL(origin);
       return (
         url.protocol === 'https:' &&
         url.port === '' &&
-        (url.hostname === 'x.com' || url.hostname === 'twitter.com')
+        [
+          'x.com',
+          'twitter.com',
+          'www.youtube.com',
+          'm.youtube.com',
+          'youtube.com'
+        ].includes(url.hostname)
       );
     } catch (_error) {
       return false;
     }
+  }
+
+  function sendHttpsJsonRequest(url) {
+    const message = { type: 'FETCH_HTTPS_JSON', url: url };
+    if (typeof browser !== 'undefined' && browser.runtime) {
+      return browser.runtime.sendMessage(message).then(function (response) {
+        if (!response || response.ok !== true) {
+          throw new Error((response && response.error) || 'HTTPS fetch failed');
+        }
+        return response.result;
+      });
+    }
+    if (typeof chrome !== 'undefined' && chrome.runtime) {
+      return new Promise(function (resolve, reject) {
+        chrome.runtime.sendMessage(message, function (value) {
+          const error = chrome.runtime && chrome.runtime.lastError;
+          if (error) {
+            reject(new Error(error.message));
+            return;
+          }
+          if (!value || value.ok !== true) {
+            reject(new Error((value && value.error) || 'HTTPS fetch failed'));
+            return;
+          }
+          resolve(value.result);
+        });
+      });
+    }
+    return Promise.reject(new Error('Browser runtime API is not available'));
+  }
+
+  function getActionContext(actionId, requireRecipient) {
+    const normalizedId = String(actionId || '');
+    const context = ACTION_ID_PATTERN.test(normalizedId)
+      ? actionContexts.get(normalizedId)
+      : null;
+    if (!context || (requireRecipient && !context.recipientPubkey)) {
+      throw new Error('Request is not bound to an active action');
+    }
+    return context;
+  }
+
+  function requireCurrentActionContext(actionId, context) {
+    if (actionContexts.get(String(actionId || '')) !== context) {
+      throw new Error('Request action is no longer active');
+    }
+  }
+
+  function profileLnurl(content) {
+    try {
+      const metadata = JSON.parse(content || '{}');
+      if (typeof metadata.lud16 === 'string') {
+        const value = metadata.lud16;
+        const separator = value.indexOf('@');
+        if (
+          separator <= 0 ||
+          separator !== value.lastIndexOf('@') ||
+          !/^[A-Za-z0-9._-]+$/.test(value.slice(0, separator)) ||
+          !/^[A-Za-z0-9.-]+$/.test(value.slice(separator + 1))
+        ) {
+          return null;
+        }
+        const name = value.slice(0, separator);
+        const domain = value.slice(separator + 1);
+        const parsed = new URL(
+          '/.well-known/lnurlp/' + encodeURIComponent(name),
+          'https://' + domain
+        );
+        return parsed.protocol === 'https:' && parsed.port === ''
+          ? parsed.toString()
+          : null;
+      }
+      if (typeof metadata.lud06 === 'string') {
+        const decoded = bech32.decode(metadata.lud06, 1000);
+        const bytes = Uint8Array.from(bech32.fromWords(decoded.words));
+        const parsed = new URL(new TextDecoder().decode(bytes));
+        return parsed.protocol === 'https:' ? parsed.toString() : null;
+      }
+    } catch (_error) {
+      return null;
+    }
+    return null;
+  }
+
+  async function resolveZapProvider(pool, relays, actionId, context) {
+    const events = await queryWithFastQuorum(pool, relays, {
+      kinds: [0],
+      authors: [context.recipientPubkey],
+      limit: 1
+    });
+    requireCurrentActionContext(actionId, context);
+    const profiles = events
+      .filter(function (event) {
+        return (
+          event?.kind === 0 &&
+          String(event.pubkey || '').toLowerCase() ===
+            context.recipientPubkey &&
+          verifyEvent(event)
+        );
+      })
+      .sort(function (left, right) {
+        const timestampOrder = right.created_at - left.created_at;
+        if (timestampOrder !== 0) return timestampOrder;
+        if (left.id < right.id) return -1;
+        if (left.id > right.id) return 1;
+        return 0;
+      });
+    const lnurl = profiles.length > 0
+      ? profileLnurl(profiles[0].content)
+      : null;
+    if (!lnurl) {
+      throw new Error('Zap recipient has no valid LNURL provider');
+    }
+
+    const response = await sendHttpsJsonRequest(lnurl);
+    requireCurrentActionContext(actionId, context);
+    const body = response?.json;
+    if (
+      response?.status < 200 ||
+      response?.status >= 300 ||
+      !body ||
+      typeof body !== 'object' ||
+      body.allowsNostr !== true ||
+      !HEX_64_PATTERN.test(String(body.nostrPubkey || ''))
+    ) {
+      throw new Error('Zap provider returned invalid metadata');
+    }
+    const callback = extension.zapHttp?.normalizeZapHttpUrl(body.callback);
+    if (!callback) {
+      throw new Error('Zap provider returned an invalid callback');
+    }
+    return {
+      lnurl: lnurl,
+      callback: callback,
+      nostrPubkey: String(body.nostrPubkey).toLowerCase(),
+      minSendable: Number.isFinite(body.minSendable)
+        ? body.minSendable
+        : null,
+      maxSendable: Number.isFinite(body.maxSendable)
+        ? body.maxSendable
+        : null,
+      commentAllowed: Number.isInteger(body.commentAllowed)
+        ? body.commentAllowed
+        : 0
+    };
+  }
+
+  function getExactTag(event, name) {
+    const matches = event.tags.filter(function (tag) {
+      return Array.isArray(tag) && tag.length >= 2 && tag[0] === name;
+    });
+    return matches.length === 1 ? matches[0][1] : null;
+  }
+
+  function validateBoundZapRequest(event, context, amount, comment) {
+    if (
+      !event ||
+      typeof event !== 'object' ||
+      event.kind !== 9734 ||
+      event.content !== comment ||
+      !Array.isArray(event.tags) ||
+      event.tags.some(function (tag) {
+        return (
+          !Array.isArray(tag) ||
+          tag.some(function (value) {
+            return typeof value !== 'string';
+          })
+        );
+      }) ||
+      !verifyEvent(event)
+    ) {
+      return null;
+    }
+    const expectedATag =
+      '39735:' + context.recipientPubkey + ':' + normalizeURL(context.url);
+    if (
+      String(getExactTag(event, 'p') || '').toLowerCase() !==
+        context.recipientPubkey ||
+      getExactTag(event, 'amount') !== String(amount) ||
+      getExactTag(event, 'a') !== expectedATag
+    ) {
+      return null;
+    }
+    return event;
+  }
+
+  function getInvoiceAmountMsats(invoice) {
+    try {
+      const decoded = decodeBolt11(invoice);
+      const amount = decoded.sections.find(function (section) {
+        return section.name === 'amount';
+      });
+      if (!amount?.value) return null;
+      const value = Number(amount.value);
+      return Number.isFinite(value) && value > 0 ? value : null;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  async function fetchZapInvoice(pool, relays, payload) {
+    const context = getActionContext(payload?.actionId, true);
+    const amount = payload?.amount;
+    const comment = typeof payload?.comment === 'string'
+      ? payload.comment
+      : '';
+    if (
+      !Number.isInteger(amount) ||
+      amount < 1000 ||
+      amount > 210000000 ||
+      comment.length > 280 ||
+      Object.keys(payload).some(
+        (key) =>
+          key !== 'actionId' &&
+          key !== 'relays' &&
+          key !== 'amount' &&
+          key !== 'comment' &&
+          key !== 'zapEvent'
+      )
+    ) {
+      throw new Error('Zap invoice request contains unexpected data');
+    }
+    const zapEvent = validateBoundZapRequest(
+      payload.zapEvent,
+      context,
+      amount,
+      comment
+    );
+    if (!zapEvent) {
+      throw new Error('Zap request is not bound to the active recipient');
+    }
+
+    const provider = await resolveZapProvider(
+      pool,
+      relays,
+      payload.actionId,
+      context
+    );
+    if (
+      (provider.minSendable !== null && amount < provider.minSendable) ||
+      (provider.maxSendable !== null && amount > provider.maxSendable) ||
+      comment.length > provider.commentAllowed
+    ) {
+      throw new Error('Zap amount or comment is not supported by the provider');
+    }
+    const callback = new URL(provider.callback);
+    callback.searchParams.set('amount', String(amount));
+    callback.searchParams.set('nostr', JSON.stringify(zapEvent));
+    if (comment) callback.searchParams.set('comment', comment);
+
+    requireCurrentActionContext(payload.actionId, context);
+    const response = await sendHttpsJsonRequest(callback.toString());
+    requireCurrentActionContext(payload.actionId, context);
+    const invoice = response?.json?.pr;
+    if (
+      response?.status < 200 ||
+      response?.status >= 300 ||
+      typeof invoice !== 'string' ||
+      getInvoiceAmountMsats(invoice) !== amount
+    ) {
+      throw new Error('Zap provider returned an invalid invoice');
+    }
+    return {
+      invoice: invoice,
+      provider: {
+        lnurl: provider.lnurl,
+        callback: provider.callback,
+        nostrPubkey: provider.nostrPubkey
+      }
+    };
+  }
+
+  function isFilterBoundToAction(filter, actionId) {
+    if (
+      filter.kinds[0] === 0 &&
+      ACTION_ID_PATTERN.test(String(actionId || '')) &&
+      actionContexts.has(actionId)
+    ) {
+      return true;
+    }
+    for (const context of actionContexts.values()) {
+      if (
+        filter.kinds[0] === 17 &&
+        filter['#i']?.[0] === context.url
+      ) {
+        return true;
+      }
+      if (
+        filter.kinds[0] === 0 &&
+        context.recipientPubkey &&
+        filter.authors.every(
+          (author) => author === context.recipientPubkey
+        )
+      ) {
+        return true;
+      }
+      if (
+        filter.kinds[0] === 9735 &&
+        context.recipientPubkey === filter['#p']?.[0] &&
+        (
+          !filter['#a'] ||
+          filter['#a'][0] ===
+            '39735:' + context.recipientPubkey + ':' + context.url
+        )
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   async function handleRequest(pool, message) {
@@ -330,16 +936,31 @@ import { normalizeURL } from 'nostr-tools/utils';
       throw new Error('Relay request contains an unsupported relay list');
     }
 
-    if (message.operation === 'getLikeState') {
+    if (
+      message.operation === 'getCachedLikeState' ||
+      message.operation === 'getLikeState'
+    ) {
       if (
         !payload ||
         Object.keys(payload).some((key) => key !== 'relays' && key !== 'url') ||
-        !isAllowedStatusUrl(payload.url)
+        !isAllowedContentUrl(payload.url) ||
+        !Array.from(actionContexts.values()).some(
+          (context) => context.url === payload.url
+        )
       ) {
         throw new Error('Known-reaction request contains unexpected data');
       }
 
       const publicKey = await extension.storage.getKnownPubkey();
+      if (message.operation === 'getCachedLikeState') {
+        const cachedEvents = await getRecentReactions(payload.url);
+        const latest = findLatestReaction(cachedEvents, publicKey);
+        return {
+          found: Boolean(latest),
+          isLiked: latest?.content === '+' || latest?.content === ''
+        };
+      }
+
       const countFilter = {
         kinds: [17],
         '#k': ['web'],
@@ -357,14 +978,12 @@ import { normalizeURL } from 'nostr-tools/utils';
         });
       }
       const queriedEvents = await queryWithFastQuorum(pool, relays, filters);
+      const recentEvents = await getRecentReactions(payload.url);
       const eventsById = new Map(
-        [...queriedEvents, ...getRecentReactions(payload.url)].map((event) => [event.id, event])
+        [...queriedEvents, ...recentEvents].map((event) => [event.id, event])
       );
       const events = Array.from(eventsById.values());
-      const ownEvents = publicKey ? events.filter((event) => event.pubkey === publicKey) : [];
-      const latest = [...ownEvents].sort(
-        (a, b) => b.created_at - a.created_at || (a.id === b.id ? 0 : a.id > b.id ? -1 : 1)
-      )[0];
+      const latest = findLatestReaction(events, publicKey);
       return {
         ...summarizeReactionEvents(events),
         isLiked: latest?.content === '+' || latest?.content === ''
@@ -373,14 +992,49 @@ import { normalizeURL } from 'nostr-tools/utils';
 
     if (message.operation === 'query') {
       const filter = validateFilter(payload.filter);
-      if (!filter) {
+      if (
+        Object.keys(payload).some(
+          (key) =>
+            key !== 'relays' &&
+            key !== 'filter' &&
+            key !== 'actionId'
+        ) ||
+        !filter ||
+        !isFilterBoundToAction(filter, payload.actionId)
+      ) {
         throw new Error('Relay request contains an unsupported filter');
       }
-      return queryWithFastQuorum(pool, relays, filter);
+      const events = await queryWithFastQuorum(pool, relays, filter);
+      if (filter.kinds[0] !== 0) return events;
+      const authors = new Set(filter.authors);
+      return events.filter(function (event) {
+        return (
+          event?.kind === 0 &&
+          authors.has(String(event.pubkey || '').toLowerCase()) &&
+          verifyEvent(event)
+        );
+      });
     }
 
     if (message.operation === 'publish') {
-      const event = validateReactionEvent(payload.event);
+      const actionId = String(payload?.actionId || '');
+      const actionContext = ACTION_ID_PATTERN.test(actionId)
+        ? actionContexts.get(actionId)
+        : null;
+      if (
+        !payload ||
+        Object.keys(payload).some(
+          (key) =>
+            key !== 'relays' && key !== 'event' && key !== 'actionId'
+        ) ||
+        !actionContext
+      ) {
+        throw new Error('Relay publish is not bound to an action');
+      }
+      const event = validateReactionEvent(
+        payload.event,
+        actionContext.url
+      );
       if (!event) {
         throw new Error('Relay request contains an invalid reaction event');
       }
@@ -394,8 +1048,36 @@ import { normalizeURL } from 'nostr-tools/utils';
         throw new Error('No relay acknowledged the reaction event');
       }
       await extension.storage.setKnownPubkey(event.pubkey);
-      rememberRecentReaction(event);
+      await rememberRecentReaction(event);
       return null;
+    }
+
+    if (
+      message.operation === 'getZapProvider' ||
+      message.operation === 'fetchZapInvoice'
+    ) {
+      const context = getActionContext(payload?.actionId, true);
+      if (message.operation === 'getZapProvider') {
+        if (
+          Object.keys(payload).some(
+            (key) => key !== 'actionId' && key !== 'relays'
+          )
+        ) {
+          throw new Error('Zap provider request contains unexpected data');
+        }
+        const provider = await resolveZapProvider(
+          pool,
+          relays,
+          payload.actionId,
+          context
+        );
+        return {
+          lnurl: provider.lnurl,
+          callback: provider.callback,
+          nostrPubkey: provider.nostrPubkey
+        };
+      }
+      return fetchZapInvoice(pool, relays, payload);
     }
 
     throw new Error('Unsupported relay operation');
@@ -414,44 +1096,82 @@ import { normalizeURL } from 'nostr-tools/utils';
 
     const pool = (options && options.pool) || new SimplePool();
     const pageWindow = (options && options.window) || window;
+    const authenticator = createBridgeAuthenticator(channel);
+    const handledRequestIds = new Set();
+
+    function rememberRequestId(requestId) {
+      handledRequestIds.add(requestId);
+      if (handledRequestIds.size > 1024) {
+        handledRequestIds.delete(handledRequestIds.values().next().value);
+      }
+    }
 
     async function onMessage(event) {
-      const message = event.data;
+      const candidate = event.data;
       if (
         event.source !== pageWindow ||
         event.origin !== pageWindow.location.origin ||
         !isAllowedPageOrigin(event.origin) ||
-        !message ||
-        message.source !== REQUEST_SOURCE ||
-        message.channel !== channel ||
-        !REQUEST_ID_PATTERN.test(String(message.requestId || ''))
+        !candidate ||
+        candidate.source !== REQUEST_SOURCE ||
+        !REQUEST_ID_PATTERN.test(String(candidate.requestId || '')) ||
+        !MESSAGE_MAC_PATTERN.test(String(candidate.mac || '')) ||
+        handledRequestIds.has(candidate.requestId)
       ) {
         return;
       }
 
+      let message;
       try {
-        const result = await handleRequest(pool, message);
-        pageWindow.postMessage(
-          {
-            source: RESPONSE_SOURCE,
-            channel: channel,
-            requestId: message.requestId,
-            ok: true,
-            result: result
-          },
-          event.origin
-        );
+        message = cloneBridgeValue(candidate);
+      } catch (_error) {
+        return;
+      }
+      if (
+        !message ||
+        message.source !== REQUEST_SOURCE ||
+        !REQUEST_ID_PATTERN.test(String(message.requestId || '')) ||
+        !MESSAGE_MAC_PATTERN.test(String(message.mac || '')) ||
+        handledRequestIds.has(message.requestId)
+      ) {
+        return;
+      }
+
+      let authenticated = false;
+      try {
+        authenticated = await authenticator.verifyRequest(message);
+      } catch (_error) {
+        return;
+      }
+      if (!authenticated || handledRequestIds.has(message.requestId)) return;
+      rememberRequestId(message.requestId);
+
+      let response;
+      try {
+        response = {
+          source: RESPONSE_SOURCE,
+          requestId: message.requestId,
+          requestMac: message.mac,
+          operation: message.operation,
+          ok: true,
+          result: await handleRequest(pool, message)
+        };
       } catch (error) {
-        pageWindow.postMessage(
-          {
-            source: RESPONSE_SOURCE,
-            channel: channel,
-            requestId: message.requestId,
-            ok: false,
-            error: error instanceof Error ? error.message : 'Relay request failed'
-          },
-          event.origin
-        );
+        response = {
+          source: RESPONSE_SOURCE,
+          requestId: message.requestId,
+          requestMac: message.mac,
+          operation: message.operation,
+          ok: false,
+          error: error instanceof Error ? error.message : 'Relay request failed'
+        };
+      }
+
+      try {
+        response.mac = await authenticator.signResponse(response);
+        pageWindow.postMessage(response, event.origin);
+      } catch (_error) {
+        // Fail closed if the bridge response cannot be authenticated.
       }
     }
 
@@ -472,9 +1192,16 @@ import { normalizeURL } from 'nostr-tools/utils';
   extension.relayClient = {
     configure: configure,
     queryWithFastQuorum: queryWithFastQuorum,
+    createBridgeAuthenticator: createBridgeAuthenticator,
+    isAllowedContentUrl: isAllowedContentUrl,
     isAllowedStatusUrl: isAllowedStatusUrl,
     validateFilter: validateFilter,
     validateReactionEvent: validateReactionEvent,
-    validateRelays: validateRelays
+    registerActionContext: registerActionContext,
+    revokeActionContext: revokeActionContext,
+    validateRelays: validateRelays,
+    isAllowedZapHttpUrl: function (value) {
+      return Boolean(extension.zapHttp && extension.zapHttp.isAllowedZapHttpUrl(value));
+    }
   };
 })();
