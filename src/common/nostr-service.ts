@@ -37,7 +37,7 @@ export class NostrService {
   }
 
   public async connectToNostr(
-    relays: string[] = [...DEFAULT_RELAYS]
+    relays: readonly string[] | string[] = [...DEFAULT_RELAYS]
   ): Promise<void> {
     if (this.isConnected) {
       // addNewRelays appends to the pool without touching existing
@@ -71,7 +71,7 @@ export class NostrService {
    * (trailing slash), so compare normalized forms to avoid re-adding the
    * same relay under a different spelling.
    */
-  private addNewRelays(relays: string[]): void {
+  private addNewRelays(relays: readonly string[] | string[]): void {
     const knownRelays = new Set(this.getRelays().map(r => normalizeURL(r)));
     for (const url of relays) {
       const normalized = normalizeURL(url);
@@ -82,8 +82,8 @@ export class NostrService {
     }
   }
 
-  private async establishConnection(relays: string[]): Promise<void> {
-    this.ndk.explicitRelayUrls = relays;
+  private async establishConnection(relays: readonly string[] | string[]): Promise<void> {
+    this.ndk.explicitRelayUrls = [...relays];
 
     try {
       await this.ndk.connect(3000);
