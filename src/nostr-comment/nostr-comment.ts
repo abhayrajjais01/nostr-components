@@ -53,7 +53,7 @@ export default class NostrComment extends HTMLElement {
         if (userRelays) {
             return userRelays.split(',').map(r => r.trim());
         }
-        return DEFAULT_RELAYS;
+        return [...DEFAULT_RELAYS];
     };
 
     getTheme = (): void => {
@@ -208,7 +208,8 @@ export default class NostrComment extends HTMLElement {
             const profilePromises = Array.from(uniquePubkeys).map(async (pubkey) => {
                 try {
                     console.log('Fetching profile for pubkey:', pubkey);
-                    const profile = await this.nostrService.getProfile({ pubkey });
+                    const user = await this.nostrService.resolveNDKUser({ pubkey });
+                    const profile = user ? await this.nostrService.getProfile(user) : null;
                     console.log('Profile fetched for', pubkey, ':', profile);
                     return { pubkey, profile };
                 } catch (error) {
@@ -363,7 +364,8 @@ export default class NostrComment extends HTMLElement {
         if (this.userPublicKey) {
             try {
                 console.log('Fetching profile for user:', this.userPublicKey);
-                const profile = await this.nostrService.getProfile({ pubkey: this.userPublicKey });
+                const user = await this.nostrService.resolveNDKUser({ pubkey: this.userPublicKey });
+                const profile = user ? await this.nostrService.getProfile(user) : null;
                 console.log('Profile fetched for current user:', profile);
 
                 if (profile) {
@@ -477,7 +479,8 @@ export default class NostrComment extends HTMLElement {
             } else {
                 // Try to fetch profile again for new comments
                 try {
-                    const profile = await this.nostrService.getProfile({ pubkey: signedEvent.pubkey });
+                    const user = await this.nostrService.resolveNDKUser({ pubkey: signedEvent.pubkey });
+                    const profile = user ? await this.nostrService.getProfile(user) : null;
                     if (profile) {
                         newComment.userProfile = profile;
                         this.currentUserProfile = profile; // Update for future comments

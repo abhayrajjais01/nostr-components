@@ -77,12 +77,12 @@ export default class NostrDm extends HTMLElement {
     this.attachShadow({ mode: "open" });
   }
 
-  getRelays = () => {
+  getRelays = (): string[] => {
     const userRelays = this.getAttribute("relays");
     if (userRelays) {
-      return userRelays.split(",");
+      return userRelays.split(",").map(r => r.trim());
     }
-    return DEFAULT_RELAYS;
+    return [...DEFAULT_RELAYS];
   };
 
   getTheme = async () => {

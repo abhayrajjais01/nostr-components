@@ -164,7 +164,7 @@ export function renderLiveChat({
 
 // Returns only the chat UI (no <style>) for composing inside wrappers
 export function renderLiveChatInner({
-  theme,
+  theme: _theme,
   recipientNpub,
   recipientName,
   recipientPicture,
